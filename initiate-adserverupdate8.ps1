@@ -8,11 +8,58 @@ param(
     [switch]$RunServerCheck,
     [switch]$ForceUpdates,
     [switch]$ScheduleReboot,
+    [string]$DCname = "nwk-dc101",
     [string]$TrustedHosts = "*",
     [string]$RebootTime = "03:00"
 )
 
 # Enhanced logging functions with structured output
+
+function Test-DomainCredential {
+    param(
+        [System.Management.Automation.PSCredential]$Credential,
+        [string]$DomainController = $DCname
+    )
+    
+    try {
+        # First attempt: Direct LDAP binding
+        $ldapPath = "LDAP://$DomainController"
+        $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, 
+            $Credential.UserName, 
+            $Credential.GetNetworkCredential().Password)
+        
+        if ($entry.name -ne $null) {
+            return @{
+                Success = $true
+                Message = "Successfully authenticated to domain controller $DomainController"
+                Username = $Credential.UserName
+            }
+        }
+        
+        # If we get here without an exception but entry.name is null, authentication failed
+        return @{
+            Success = $false
+            Message = "Authentication failed - Invalid credentials"
+            Username = $Credential.UserName
+        }
+    }
+    catch [System.Management.Automation.MethodInvocationException] {
+        return @{
+            Success = $false
+            Message = "Authentication failed - Access Denied"
+            Username = $Credential.UserName
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Message = "Authentication failed - $($_.Exception.Message)"
+            Username = $Credential.UserName
+        }
+    }
+}
+
+
 function Write-DetailedLog {
     param(
         [string]$Message,
@@ -73,6 +120,8 @@ function Write-ProgressLog {
 }
 
 # Enhanced Windows version detection with detailed logging
+
+
 function Get-WindowsVersionDetailed {
     param([string]$ServerName = "LOCAL")
     
@@ -404,19 +453,7 @@ function Enable-WindowsUpdatesPolicy {
         $auPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
         $wuPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
         
-        # Create paths if they don't exist
-        if (!(Test-Path $wuPath)) {
-            New-Item -Path $wuPath -Force | Out-Null
-            $result.Changes += "Created WindowsUpdate policy path"
-            Write-ProgressLog "Created WindowsUpdate policy path: $wuPath" -Component "POLICY" -ServerName $ServerName
-        }
-        if (!(Test-Path $auPath)) {
-            New-Item -Path $auPath -Force | Out-Null
-            $result.Changes += "Created AU policy path"
-            Write-ProgressLog "Created AU policy path: $auPath" -Component "POLICY" -ServerName $ServerName
-        }
-
-        # Backup current policies
+                # Backup current policies
         $backupPath = "HKLM:\SOFTWARE\BackupWindowsUpdatePolicies_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         if (Test-Path $auPath) {
             try {
@@ -428,6 +465,19 @@ function Enable-WindowsUpdatesPolicy {
                 Write-WarningLog "Failed to backup policies: $($_.Exception.Message)" -Component "POLICY" -ServerName $ServerName
             }
         }
+
+        $backupFile = "C:\BackupWindowsUpdatePolicies_$(Get-Date -Format 'yyyyMMdd_HHmmss').reg"
+try {
+    $exportCmd = "reg.exe export `"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`" `"$backupFile`" /y"
+    Invoke-Expression $exportCmd
+    $result.Changes += "Backed up current policies to $backupFile"
+    $result.BackupPath = $backupFile
+    Write-SuccessLog "Current policies backed up to: $backupFile" -Component "POLICY" -ServerName $ServerName
+} catch {
+    Write-WarningLog "Failed to backup policies: $($_.Exception.Message)" -Component "POLICY" -ServerName $ServerName
+}
+
+
 
         # Log current policy values before changes
         $currentPolicies = @{}
@@ -508,6 +558,96 @@ function Enable-WindowsUpdatesPolicy {
     
     return $result
 }
+function Force-WindowsUpdateInstallation {
+    $result = @{
+        Success = $false
+        Message = ""
+        UpdatesFound = 0
+        UpdatesInstalled = 0
+    }
+    try {
+        Write-Host "🔄 Forcing Windows Update detection and installation..." -ForegroundColor Yellow
+        try {
+            Set-Service -Name wuauserv -StartupType Automatic
+            $result.Message += "wuauserv set to Automatic. "
+        } catch {
+            Write-ErrorLog "Force-WindowsUpdateInstallation: Failed to set wuauserv to Automatic: $($_.Exception.Message)"
+            $result.Message += "Failed to set wuauserv to Automatic: $($_.Exception.Message). "
+        }
+        try {
+            Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            Start-Service -Name wuauserv
+            Start-Sleep -Seconds 3
+            $result.Message += "Windows Update service restarted. "
+        } catch {
+            Write-ErrorLog "Force-WindowsUpdateInstallation: Service restart failed: $($_.Exception.Message)"
+            $result.Message += "Service restart failed: $($_.Exception.Message). "
+        }
+        try {
+            $updateSession = New-Object -ComObject Microsoft.Update.Session
+            $updateSearcher = $updateSession.CreateUpdateSearcher()
+            Write-Host "🔍 Searching for available updates..." -ForegroundColor Cyan
+            $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+            $result.UpdatesFound = $searchResult.Updates.Count
+            if ($searchResult.Updates.Count -gt 0) {
+                Write-Host "📦 Found $($searchResult.Updates.Count) updates to install" -ForegroundColor Green
+                $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+                foreach ($update in $searchResult.Updates) {
+                    if ($update.EulaAccepted -eq $false) {
+                        $update.AcceptEula()
+                    }
+                    $updatesToInstall.Add($update) | Out-Null
+                    Write-Host "  • $($update.Title)" -ForegroundColor White
+                }
+                Write-Host "⬇️  Downloading updates..." -ForegroundColor Cyan
+                $downloader = $updateSession.CreateUpdateDownloader()
+                $downloader.Updates = $updatesToInstall
+                $downloadResult = $downloader.Download()
+                if ($downloadResult.ResultCode -eq 2) {
+                    Write-Host "✅ Updates downloaded successfully" -ForegroundColor Green
+                    Write-Host "⚙️  Installing updates..." -ForegroundColor Cyan
+                    $installer = $updateSession.CreateUpdateInstaller()
+                    $installer.Updates = $updatesToInstall
+                    $installResult = $installer.Install()
+                    $result.UpdatesInstalled = $installResult.GetUpdateResult(0).ResultCode
+                    if ($installResult.ResultCode -eq 2) {
+                        $result.Success = $true
+                        $result.Message += "Updates installed successfully. "
+                        if ($installResult.RebootRequired) {
+                            $result.Message += "Reboot required. "
+                        }
+                    } else {
+                        Write-ErrorLog "Force-WindowsUpdateInstallation: Installation failed with code: $($installResult.ResultCode)"
+                        $result.Message += "Installation failed with code: $($installResult.ResultCode). "
+                    }
+                } else {
+                    Write-ErrorLog "Force-WindowsUpdateInstallation: Download failed with code: $($downloadResult.ResultCode)"
+                    $result.Message += "Download failed with code: $($downloadResult.ResultCode). "
+                }
+            } else {
+                $result.Success = $true
+                $result.Message += "No updates available. "
+            }
+        } catch {
+            Write-ErrorLog "Force-WindowsUpdateInstallation: Update process failed: $($_.Exception.Message)"
+            $result.Message += "Update process failed: $($_.Exception.Message). "
+        }
+        try {
+            $autoUpdateClient = New-Object -ComObject Microsoft.Update.AutoUpdate
+            $autoUpdateClient.DetectNow()
+            $result.Message += "Triggered automatic detection. "
+        } catch {
+            Write-ErrorLog "Force-WindowsUpdateInstallation: AutoUpdate.DetectNow failed: $($_.Exception.Message)"
+        }
+    } catch {
+        Write-ErrorLog "Force-WindowsUpdateInstallation: Force update failed: $($_.Exception.Message)"
+        $result.Success = $false
+        $result.Message = "Force update failed: $($_.Exception.Message)"
+    }
+    return $result
+}
+
 function Set-RebootSchedule {
     param([string]$Time = "03:00")
     $result = @{
@@ -549,7 +689,57 @@ function Start-ServerUpdateCheck {
         Write-ErrorLog "CredSSP is not enabled on this client. Command needed: Enable-WSManCredSSP -Role Client -DelegateComputer '$TrustedHosts' -Force"
         # Do NOT return, just warn and continue
     }
-    $cred = Get-Credential -Message "Enter domain credentials for server access"
+
+    # Modify the credential collection and validation part in your script
+    Write-Host "`n🔐 Please enter domain credentials..." -ForegroundColor Cyan
+    $maxAttempts = 3
+    $attempt = 1
+
+do {
+    if ($attempt -gt 1) {
+        Write-Host "`n⚠️ Attempt $attempt of $maxAttempts" -ForegroundColor Yellow
+    }
+    
+    $cred = Get-Credential -Message "Enter domain credentials for server access (Attempt $attempt of $maxAttempts)"
+    
+    if ($null -eq $cred) {
+        Write-Host "❌ Credential entry cancelled by user" -ForegroundColor Red
+        return
+    }
+
+    Write-Host "`n🔄 Validating credentials..." -ForegroundColor Cyan
+    $authResult = Test-DomainCredential -Credential $cred -DomainController "nwk-dc101"
+    
+    if ($authResult.Success) {
+        Write-Host "✅ Authentication successful!" -ForegroundColor Green
+        Write-Host "👤 Logged in as: $($authResult.Username)" -ForegroundColor Green
+        Write-Host "🔵 $($authResult.Message)" -ForegroundColor Green
+        break
+    }
+    else {
+        Write-Host "❌ Authentication failed!" -ForegroundColor Red
+        Write-Host "⚠️ $($authResult.Message)" -ForegroundColor Yellow
+        
+        if ($attempt -ge $maxAttempts) {
+            Write-Host "`n❌ Maximum authentication attempts reached. Exiting script." -ForegroundColor Red
+            return
+        }
+    }
+    
+    $attempt++
+} while ($attempt -le $maxAttempts)
+
+# Only continue if authentication was successful
+if (-not $authResult.Success) {
+    return
+}
+
+
+
+
+
+
+
     $outputFile = "NON-AD-Prodservers-ForceUpdate.csv"
     $results = @()
     Write-Host "🔍 Retrieving servers from AD..." -ForegroundColor Cyan
@@ -558,7 +748,7 @@ function Start-ServerUpdateCheck {
 $filterString = ($patterns | ForEach-Object { "Name -like '$_'" }) -join ' -or '
 
 try {
-    $servers = Get-ADComputer -Filter $filterString -Server "nwk-dc101" -Properties Name, IPv4Address
+    $servers = Get-ADComputer -Filter $filterString -Server $DCname -Properties Name, IPv4Address
     Write-Host "📊 Found $($servers.Count) servers to process" -ForegroundColor Cyan
 } catch {
     Write-ErrorLog "Start-ServerUpdateCheck: Failed to retrieve servers from AD: $($_.Exception.Message)"
@@ -803,7 +993,59 @@ $remoteInfoScript = {
                         } catch {
                             Write-ErrorLog "Error modifying Windows Update registry settings: $($_.Exception.Message)"
                         }
-                    }
+
+
+                        if (-not $updateSuccess) {
+        # Fallback 1: Try PowerShell Update cmdlets (if available)
+        try {
+            Import-Module PSWindowsUpdate -ErrorAction Stop
+            Install-WindowsUpdate -AcceptAll -AutoReboot -IgnoreReboot -ErrorAction Stop
+            $updateSuccess = $true
+        } catch {
+            $errorDetails += "PSWindowsUpdate cmdlets failed: $($_.Exception.Message)"
+        }
+    }
+
+        if (-not $updateSuccess) {
+            # Fallback 2: Try wuauclt.exe
+            try {
+                Start-Process -FilePath "wuauclt.exe" -ArgumentList "/detectnow /updatenow" -NoNewWindow -Wait
+                Start-Sleep -Seconds 10
+                $updateSuccess = $true  # This doesn't guarantee update, just triggers it
+            } catch {
+                $errorDetails += "wuauclt.exe failed: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $updateSuccess) {
+            # Fallback 3: Try usoclient.exe (Windows 10+)
+            try {
+                Start-Process -FilePath "usoclient.exe" -ArgumentList "StartScan" -NoNewWindow -Wait
+                Start-Process -FilePath "usoclient.exe" -ArgumentList "StartDownload" -NoNewWindow -Wait
+                Start-Process -FilePath "usoclient.exe" -ArgumentList "StartInstall" -NoNewWindow -Wait
+                $updateSuccess = $true
+            } catch {
+                $errorDetails += "usoclient.exe failed: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $updateSuccess) {
+            $errorDetails += "All force update methods failed."
+        }
+
+        # Always log details if nothing works
+        if (-not $updateSuccess) {
+            $logPath = "error.log"
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Add-Content -Path $logPath -Value "$timestamp [ERROR] [UPDATE] [$env:COMPUTERNAME] Force update failed. Details: $($errorDetails -join '; ')"
+        }
+
+        return @{
+            UpdateSuccess = $updateSuccess
+            ErrorDetails = $errorDetails
+        }
+    
+        }
                     function Enable-WindowsUpdatesPolicy {
                         param([bool]$ForceInstall = $false, [string]$RebootTime = "03:00")
                         $result = @{
@@ -909,31 +1151,51 @@ $remoteInfoScript = {
 
             # 4. Process each update
             foreach ($update in $searchResult.Updates) {
-                try {
-                    Write-Host "  • Processing: $($update.Title)" -ForegroundColor White
-                    
-                    # Accept EULA if needed
-                    if (-not $update.EulaAccepted) {
-                        $update.AcceptEula()
-                        Write-Host "    ✓ EULA Accepted" -ForegroundColor Gray
-                    }
+    try {
+        Write-Host "  • Processing: $($update.Title)" -ForegroundColor White
 
-                    # Verify update is applicable
-                    if ($update.IsDownloaded) {
-                        Write-Host "    ✓ Already downloaded" -ForegroundColor Gray
-                    }
+        # Accept EULA if needed
+        if (-not $update.EulaAccepted) {
+            $update.AcceptEula()
+            Write-Host "    ✓ EULA Accepted" -ForegroundColor Gray
+        }
 
-                    $updatesToInstall.Add($update) | Out-Null
-                    $result.Details += "Update added to queue: $($update.Title)"
-                    Write-SuccessLog "Update queued: $($update.Title)"
-                }
-                catch {
-                    Write-ErrorLog "Failed to process update $($update.Title): $($_.Exception.Message)"
-                    Write-Host "    ⚠️ Failed to process update" -ForegroundColor Yellow
-                    continue
-                }
+        # Ensure update is downloaded
+        if (-not $update.IsDownloaded) {
+            $updateDownloader = $update.Session.CreateUpdateDownloader()
+            $singleUpdateColl = New-Object -ComObject Microsoft.Update.UpdateColl
+            $singleUpdateColl.Add($update) | Out-Null
+            $updateDownloader.Updates = $singleUpdateColl
+            $downloadResult = $updateDownloader.Download()
+            if ($downloadResult.ResultCode -ne 2) {
+                throw "Download failed (code $($downloadResult.ResultCode))"
             }
+        }
 
+        # Install the update
+        $installer = New-Object -ComObject Microsoft.Update.Installer
+        $singleUpdateColl = New-Object -ComObject Microsoft.Update.UpdateColl
+        $singleUpdateColl.Add($update) | Out-Null
+        $installer.Updates = $singleUpdateColl
+        $installResult = $installer.Install()
+
+        if ($installResult.ResultCode -eq 2) {
+            Write-SuccessLog "Update installed: $($update.Title)" -Component "UPDATE"
+            $result.Details += "Update installed: $($update.Title)"
+        } else {
+            $failMsg = "Install failed for $($update.Title): Code $($installResult.ResultCode)"
+            Write-ErrorLog $failMsg -Component "UPDATE"
+            $result.Details += $failMsg
+        }
+    } catch {
+        $failMsg = "Update failed: $($update.Title): $($_.Exception.Message)"
+        Write-ErrorLog $failMsg -Component "UPDATE"
+        $result.Details += $failMsg
+        Write-Host "    ⚠️ Failed to install update" -ForegroundColor Yellow
+        continue
+    }
+}
+            
             if ($updatesToInstall.Count -gt 0) {
                 # 5. Download updates
                 Write-Host "⬇️ Downloading updates..." -ForegroundColor Cyan
@@ -1137,6 +1399,9 @@ $remoteInfoScript = {
                 Write-ErrorLog "Start-ServerUpdateCheck: Server $($serverName) unreachable"
                 Write-Host "❌ Server unreachable" -ForegroundColor Red
             }
+            if (-not $remoteResult.UpdateSuccess) {
+              Write-ErrorLog "Server $($serverName) : Force update failed. Details: $($remoteResult.ErrorDetails -join '; ')" -Component "UPDATE" -ServerName $serverName
+                                                }
         } catch {
             $status = "Error: $($_.Exception.Message)"
             Write-ErrorLog "Start-ServerUpdateCheck: General error for $($serverName) $($_.Exception.Message)"
@@ -1170,7 +1435,7 @@ $remoteInfoScript = {
         Write-ErrorLog "Start-ServerUpdateCheck: Failed to export results: $($_.Exception.Message)"
         Write-Error "Failed to export results: $_"
     }
-}
+} # <--- CLOSES function Start-ServerUpdateCheck
 
 # Main execution logic
 if ($SetupCredSSP) {
