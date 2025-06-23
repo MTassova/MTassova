@@ -389,16 +389,18 @@ function Start-ServerUpdateCheck {
     $outputFile = "NON-AD-Prodservers-ForceUpdate.csv"
     $results = @()
     Write-Host "🔍 Retrieving servers from AD..." -ForegroundColor Cyan
-    try {
-        $servers = Get-ADComputer -Filter {
-            Name -like "*TST*" -or Name -like "ACC*" -or Name -like "*DEV*" -or Name -like "*-ts*" -or Name -like "*ACC*"
-        } -Server "nwk-dc101" -Properties Name, IPv4Address
-        Write-Host "📊 Found $($servers.Count) servers to process" -ForegroundColor Cyan
-    } catch {
-        Write-ErrorLog "Start-ServerUpdateCheck: Failed to retrieve servers from AD: $($_.Exception.Message)"
-        Write-Error "Failed to retrieve servers from AD: $_"
-        return
-    }
+   $patterns = @('*TST*', 'ACC*', '*DEV*', '*-TS*', '*ACC*','TST*','ALG*','*CIC*')
+# Dynamically construct the filter string
+$filterString = ($patterns | ForEach-Object { "Name -like '$_'" }) -join ' -or '
+
+try {
+    $servers = Get-ADComputer -Filter $filterString -Server "nwk-dc101" -Properties Name, IPv4Address
+    Write-Host "📊 Found $($servers.Count) servers to process" -ForegroundColor Cyan
+} catch {
+    Write-ErrorLog "Start-ServerUpdateCheck: Failed to retrieve servers from AD: $($_.Exception.Message)"
+    Write-Error "Failed to retrieve servers from AD: $_"
+    return
+}
     foreach ($server in $servers) {
         $serverName = $server.Name
         $ip = $server.IPv4Address
@@ -694,67 +696,162 @@ $remoteInfoScript = {
                         }
                         return $result
                     }
+                   
                     function Force-WindowsUpdateInstallation {
-                        $result = @{
-                            Success = $false
-                            Message = ""
-                            UpdatesFound = 0
-                            UpdatesInstalled = 0
-                        }
-                        try {
-                            Set-Service -Name wuauserv -StartupType Automatic
-                            Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
-                            Start-Sleep -Seconds 2
-                            Start-Service -Name wuauserv
-                            Start-Sleep -Seconds 3
-                            $updateSession = New-Object -ComObject Microsoft.Update.Session
-                            $updateSearcher = $updateSession.CreateUpdateSearcher()
-                            $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
-                            $result.UpdatesFound = $searchResult.Updates.Count
-                            if ($searchResult.Updates.Count -gt 0) {
-                                $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-                                foreach ($update in $searchResult.Updates) {
-                                    if ($update.EulaAccepted -eq $false) {
-                                        $update.AcceptEula()
-                                    }
-                                    $updatesToInstall.Add($update) | Out-Null
-                                }
-                                $downloader = $updateSession.CreateUpdateDownloader()
-                                $downloader.Updates = $updatesToInstall
-                                $downloadResult = $downloader.Download()
-                                if ($downloadResult.ResultCode -eq 2) {
-                                    $installer = $updateSession.CreateUpdateInstaller()
-                                    $installer.Updates = $updatesToInstall
-                                    $installResult = $installer.Install()
-                                    $result.UpdatesInstalled = $installResult.GetUpdateResult(0).ResultCode
-                                    if ($installResult.ResultCode -eq 2) {
-                                        $result.Success = $true
-                                        $result.Message += "Updates installed successfully. "
-                                        if ($installResult.RebootRequired) {
-                                            $result.Message += "Reboot required. "
-                                        }
-                                    } else {
-                                        Write-ErrorLog "Force-WindowsUpdateInstallation: Installation failed with code: $($installResult.ResultCode)"
-                                        $result.Message += "Installation failed with code: $($installResult.ResultCode). "
-                                    }
-                                } else {
-                                    Write-ErrorLog "Force-WindowsUpdateInstallation: Download failed with code: $($downloadResult.ResultCode)"
-                                    $result.Message += "Download failed with code: $($downloadResult.ResultCode). "
-                                }
-                            } else {
-                                $result.Success = $true
-                                $result.Message += "No updates available. "
-                            }
-                            $autoUpdateClient = New-Object -ComObject Microsoft.Update.AutoUpdate
-                            $autoUpdateClient.DetectNow()
-                            $result.Message += "Triggered automatic detection. "
-                        } catch {
-                            Write-ErrorLog "Force-WindowsUpdateInstallation: Force update failed: $($_.Exception.Message)"
-                            $result.Success = $false
-                            $result.Message = "Force update failed: $($_.Exception.Message)"
-                        }
-                        return $result
+    $result = @{
+        Success = $false
+        Message = ""
+        UpdatesFound = 0
+        UpdatesInstalled = 0
+        Details = @()
+    }
+
+    try {
+        Write-Host "🔄 Starting Windows Update force installation process..." -ForegroundColor Yellow
+        Write-SuccessLog "Starting Windows Update force installation - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+
+        # 1. Ensure Windows Update service is running and properly configured
+        Write-Host "👉 Configuring Windows Update service..." -ForegroundColor Cyan
+        try {
+            Stop-Service -Name wuauserv -Force -ErrorAction Stop
+            Set-Service -Name wuauserv -StartupType Automatic
+            Start-Service -Name wuauserv
+            Start-Sleep -Seconds 5  # Give service time to stabilize
+            $result.Details += "Windows Update service configured successfully"
+            Write-SuccessLog "Windows Update service reconfigured"
+        }
+        catch {
+            Write-ErrorLog "Service configuration failed: $($_.Exception.Message)"
+            throw "Failed to configure Windows Update service: $($_.Exception.Message)"
+        }
+
+        # 2. Create update session with extended timeout
+        Write-Host "👉 Creating Update Session..." -ForegroundColor Cyan
+        $updateSession = New-Object -ComObject Microsoft.Update.Session
+        $updateSession.ClientApplicationID = "UpdateForce Script"
+        $updateSearcher = $updateSession.CreateUpdateSearcher()
+
+        # 3. Search for updates with detailed criteria
+        Write-Host "🔍 Searching for available updates..." -ForegroundColor Cyan
+        $searchCriteria = "IsInstalled=0 and Type='Software' and IsHidden=0"
+        $searchResult = $updateSearcher.Search($searchCriteria)
+        $result.UpdatesFound = $searchResult.Updates.Count
+
+        if ($result.UpdatesFound -gt 0) {
+            Write-Host "📦 Found $($result.UpdatesFound) updates to install" -ForegroundColor Green
+            Write-SuccessLog "Found $($result.UpdatesFound) updates to install"
+            
+            $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+
+            # 4. Process each update
+            foreach ($update in $searchResult.Updates) {
+                try {
+                    Write-Host "  • Processing: $($update.Title)" -ForegroundColor White
+                    
+                    # Accept EULA if needed
+                    if (-not $update.EulaAccepted) {
+                        $update.AcceptEula()
+                        Write-Host "    ✓ EULA Accepted" -ForegroundColor Gray
                     }
+
+                    # Verify update is applicable
+                    if ($update.IsDownloaded) {
+                        Write-Host "    ✓ Already downloaded" -ForegroundColor Gray
+                    }
+
+                    $updatesToInstall.Add($update) | Out-Null
+                    $result.Details += "Update added to queue: $($update.Title)"
+                    Write-SuccessLog "Update queued: $($update.Title)"
+                }
+                catch {
+                    Write-ErrorLog "Failed to process update $($update.Title): $($_.Exception.Message)"
+                    Write-Host "    ⚠️ Failed to process update" -ForegroundColor Yellow
+                    continue
+                }
+            }
+
+            if ($updatesToInstall.Count -gt 0) {
+                # 5. Download updates
+                Write-Host "⬇️ Downloading updates..." -ForegroundColor Cyan
+                $downloader = $updateSession.CreateUpdateDownloader()
+                $downloader.Updates = $updatesToInstall
+                $downloadResult = $downloader.Download()
+
+                if ($downloadResult.ResultCode -eq 2) { # 2 = success
+                    Write-Host "✅ Updates downloaded successfully" -ForegroundColor Green
+                    Write-SuccessLog "Updates downloaded successfully"
+
+                    # 6. Install updates
+                    Write-Host "⚙️ Installing updates..." -ForegroundColor Cyan
+                    $installer = $updateSession.CreateUpdateInstaller()
+                    $installer.Updates = $updatesToInstall
+                    $installResult = $installer.Install()
+
+                    # 7. Process installation results
+                    $result.UpdatesInstalled = ($installResult.GetUpdateResults() | 
+                        Where-Object { $_.ResultCode -eq 2 }).Count
+
+                    $result.Success = ($installResult.ResultCode -eq 2)
+                    $result.Message = "Installation completed. $($result.UpdatesInstalled) of $($result.UpdatesFound) updates installed successfully."
+                    
+                    if ($installResult.RebootRequired) {
+                        $result.Message += " Reboot required."
+                    }
+
+                    Write-SuccessLog $result.Message
+                }
+                else {
+                    throw "Download failed with code: $($downloadResult.ResultCode)"
+                }
+            }
+        }
+        else {
+            Write-Host "✅ No updates available to install" -ForegroundColor Green
+            $result.Success = $true
+            $result.Message = "No updates available for installation"
+            Write-SuccessLog "No updates found to install"
+        }
+
+        # 8. Force update detection for next run
+        try {
+            $autoUpdateClient = New-Object -ComObject Microsoft.Update.AutoUpdate
+            $autoUpdateClient.DetectNow()
+            $result.Details += "Triggered automatic detection for next run"
+        }
+        catch {
+            Write-ErrorLog "Failed to trigger automatic detection: $($_.Exception.Message)"
+        }
+
+        # 9. Verify installation
+        Write-Host "🔍 Verifying installation..." -ForegroundColor Cyan
+        $verifySearch = $updateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+        $remainingUpdates = $verifySearch.Updates.Count
+        $result.Details += "Remaining updates after installation: $remainingUpdates"
+        Write-SuccessLog "Verification complete - Remaining updates: $remainingUpdates"
+
+    }
+    catch {
+        $errorMessage = "Force update failed: $($_.Exception.Message)"
+        Write-ErrorLog $errorMessage
+        $result.Success = $false
+        $result.Message = $errorMessage
+    }
+
+    # Final logging
+    if ($result.Success) {
+        Write-Host "✅ Update process completed successfully" -ForegroundColor Green
+    }
+    else {
+        Write-Host "❌ Update process completed with errors" -ForegroundColor Red
+    }
+
+    Write-Host "📝 Details:" -ForegroundColor Cyan
+    foreach ($detail in $result.Details) {
+        Write-Host "   • $detail" -ForegroundColor White
+    }
+
+    return $result
+}
                     function Set-RebootSchedule {
                         param([string]$Time = "03:00")
                         $result = @{
