@@ -59,6 +59,31 @@ function Test-DomainCredential {
     }
 }
 
+function Test-RemoteAuthentication {
+     param (
+        [Parameter(Mandatory=$true)]
+        [string]$Server,
+
+        [Parameter(Mandatory=$true)]
+        [System.Management.Automation.PSCredential]$Credential
+    )
+
+
+    try {
+        $session = New-PSSession -ComputerName $Server -Credential $Credential -Authentication Credssp -ErrorAction Stop
+        Remove-PSSession $session
+        Write-Host "Authentication to $Server succeeded."
+        return $true
+    } catch {
+        Write-Host "Authentication to $($Server) failed."
+        Write-Host "Error Message: $($_.Exception.Message)"
+        Write-Host "Stack Trace: $($_.Exception.StackTrace)"
+        if ($_.Exception.InnerException) {
+            Write-Host "Inner Exception: $($_.Exception.InnerException.Message)"
+        }
+        return $false
+    }
+}
 
 function Write-DetailedLog {
     param(
@@ -558,93 +583,187 @@ try {
     
     return $result
 }
+
 function Force-WindowsUpdateInstallation {
+    param(
+        [string]$ServerName = "LOCAL",
+        [switch]$NoReboot
+    )
+
     $result = @{
         Success = $false
         Message = ""
         UpdatesFound = 0
         UpdatesInstalled = 0
+        MethodsAttempted = @()
+        Errors = @()
+        RebootRequired = $false
     }
+
+    Write-Host "🔄 Starting Windows Update installation process..." -ForegroundColor Yellow
+    
+    # 1. Configure Windows Update Service
     try {
-        Write-Host "🔄 Forcing Windows Update detection and installation..." -ForegroundColor Yellow
-        try {
+        $wuauserv = Get-Service -Name wuauserv
+        if ($wuauserv.StartType -ne 'Automatic') {
             Set-Service -Name wuauserv -StartupType Automatic
-            $result.Message += "wuauserv set to Automatic. "
-        } catch {
-            Write-ErrorLog "Force-WindowsUpdateInstallation: Failed to set wuauserv to Automatic: $($_.Exception.Message)"
-            $result.Message += "Failed to set wuauserv to Automatic: $($_.Exception.Message). "
+            $result.Message += "Set Windows Update service to Automatic. "
         }
-        try {
+        
+        if ($wuauserv.Status -ne 'Running') {
             Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 2
             Start-Service -Name wuauserv
             Start-Sleep -Seconds 3
             $result.Message += "Windows Update service restarted. "
-        } catch {
-            Write-ErrorLog "Force-WindowsUpdateInstallation: Service restart failed: $($_.Exception.Message)"
-            $result.Message += "Service restart failed: $($_.Exception.Message). "
-        }
-        try {
-            $updateSession = New-Object -ComObject Microsoft.Update.Session
-            $updateSearcher = $updateSession.CreateUpdateSearcher()
-            Write-Host "🔍 Searching for available updates..." -ForegroundColor Cyan
-            $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
-            $result.UpdatesFound = $searchResult.Updates.Count
-            if ($searchResult.Updates.Count -gt 0) {
-                Write-Host "📦 Found $($searchResult.Updates.Count) updates to install" -ForegroundColor Green
-                $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-                foreach ($update in $searchResult.Updates) {
-                    if ($update.EulaAccepted -eq $false) {
-                        $update.AcceptEula()
-                    }
-                    $updatesToInstall.Add($update) | Out-Null
-                    Write-Host "  • $($update.Title)" -ForegroundColor White
-                }
-                Write-Host "⬇️  Downloading updates..." -ForegroundColor Cyan
-                $downloader = $updateSession.CreateUpdateDownloader()
-                $downloader.Updates = $updatesToInstall
-                $downloadResult = $downloader.Download()
-                if ($downloadResult.ResultCode -eq 2) {
-                    Write-Host "✅ Updates downloaded successfully" -ForegroundColor Green
-                    Write-Host "⚙️  Installing updates..." -ForegroundColor Cyan
-                    $installer = $updateSession.CreateUpdateInstaller()
-                    $installer.Updates = $updatesToInstall
-                    $installResult = $installer.Install()
-                    $result.UpdatesInstalled = $installResult.GetUpdateResult(0).ResultCode
-                    if ($installResult.ResultCode -eq 2) {
-                        $result.Success = $true
-                        $result.Message += "Updates installed successfully. "
-                        if ($installResult.RebootRequired) {
-                            $result.Message += "Reboot required. "
-                        }
-                    } else {
-                        Write-ErrorLog "Force-WindowsUpdateInstallation: Installation failed with code: $($installResult.ResultCode)"
-                        $result.Message += "Installation failed with code: $($installResult.ResultCode). "
-                    }
-                } else {
-                    Write-ErrorLog "Force-WindowsUpdateInstallation: Download failed with code: $($downloadResult.ResultCode)"
-                    $result.Message += "Download failed with code: $($downloadResult.ResultCode). "
-                }
-            } else {
-                $result.Success = $true
-                $result.Message += "No updates available. "
-            }
-        } catch {
-            Write-ErrorLog "Force-WindowsUpdateInstallation: Update process failed: $($_.Exception.Message)"
-            $result.Message += "Update process failed: $($_.Exception.Message). "
-        }
-        try {
-            $autoUpdateClient = New-Object -ComObject Microsoft.Update.AutoUpdate
-            $autoUpdateClient.DetectNow()
-            $result.Message += "Triggered automatic detection. "
-        } catch {
-            Write-ErrorLog "Force-WindowsUpdateInstallation: AutoUpdate.DetectNow failed: $($_.Exception.Message)"
         }
     } catch {
-        Write-ErrorLog "Force-WindowsUpdateInstallation: Force update failed: $($_.Exception.Message)"
-        $result.Success = $false
-        $result.Message = "Force update failed: $($_.Exception.Message)"
+        $result.Errors += "Service configuration failed: $($_.Exception.Message)"
+        Write-ErrorLog "Force-WindowsUpdateInstallation: Service configuration failed: $($_.Exception.Message)"
     }
+
+    # 2. Try PSWindowsUpdate module first (most reliable method)
+    try {
+        $result.MethodsAttempted += "PSWindowsUpdate"
+        if (!(Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+            Install-Module -Name PSWindowsUpdate -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+            Import-Module PSWindowsUpdate -Force
+        }
+
+        $updates = Get-WindowsUpdate -AcceptAll -IgnoreReboot
+        $result.UpdatesFound = ($updates | Measure-Object).Count
+
+        if ($result.UpdatesFound -gt 0) {
+            Write-Host "📦 Found $($result.UpdatesFound) updates using PSWindowsUpdate" -ForegroundColor Green
+            foreach ($update in $updates) {
+                Write-Host "  • $($update.Title)" -ForegroundColor White
+            }
+
+            $installResult = Install-WindowsUpdate -AcceptAll -IgnoreReboot -Verbose
+            $result.UpdatesInstalled = ($installResult | Where-Object {$_.Result -eq "Installed"} | Measure-Object).Count
+            $result.Success = $true
+            $result.Message += "Updates installed using PSWindowsUpdate. "
+            $result.RebootRequired = $installResult.RebootRequired
+            return $result
+        }
+    } catch {
+        $result.Errors += "PSWindowsUpdate method failed: $($_.Exception.Message)"
+        Write-ErrorLog "Force-WindowsUpdateInstallation: PSWindowsUpdate failed: $($_.Exception.Message)"
+        # Continue to next method
+    }
+
+    # 3. Try Windows Update Agent COM API
+    try {
+        $result.MethodsAttempted += "COM API"
+        $updateSession = New-Object -ComObject Microsoft.Update.Session
+        $updateSearcher = $updateSession.CreateUpdateSearcher()
+        
+        Write-Host "🔍 Searching for available updates using WUA API..." -ForegroundColor Cyan
+        $searchResult = $updateSearcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+        $result.UpdatesFound = $searchResult.Updates.Count
+
+        if ($searchResult.Updates.Count -gt 0) {
+            Write-Host "📦 Found $($searchResult.Updates.Count) updates to install" -ForegroundColor Green
+            $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+
+            foreach ($update in $searchResult.Updates) {
+                $update.AcceptEula()
+                $updatesToInstall.Add($update) | Out-Null
+                Write-Host "  • $($update.Title)" -ForegroundColor White
+            }
+
+            Write-Host "⬇️  Downloading updates..." -ForegroundColor Cyan
+            $downloader = $updateSession.CreateUpdateDownloader()
+            $downloader.Updates = $updatesToInstall
+            $downloadResult = $downloader.Download()
+
+            if ($downloadResult.ResultCode -eq 2) { # orcSucceeded
+                Write-Host "✅ Updates downloaded successfully" -ForegroundColor Green
+                Write-Host "⚙️  Installing updates..." -ForegroundColor Cyan
+
+                $installer = $updateSession.CreateUpdateInstaller()
+                $installer.Updates = $updatesToInstall
+                $installResult = $installer.Install()
+
+                $result.UpdatesInstalled = ($updatesToInstall | Where-Object {$installResult.GetUpdateResult($_).ResultCode -eq 2} | Measure-Object).Count
+                
+                if ($installResult.ResultCode -eq 2) { # orcSucceeded
+                    $result.Success = $true
+                    $result.Message += "Updates installed successfully via COM API. "
+                    $result.RebootRequired = $installResult.RebootRequired
+                } else {
+                    throw "Installation failed with code: $($installResult.ResultCode)"
+                }
+            } else {
+                throw "Download failed with code: $($downloadResult.ResultCode)"
+            }
+        } else {
+            $result.Success = $true
+            $result.Message += "No updates available via COM API. "
+        }
+    } catch {
+        $result.Errors += "COM API method failed: $($_.Exception.Message)"
+        Write-ErrorLog "Force-WindowsUpdateInstallation: COM API failed: $($_.Exception.Message)"
+    }
+
+    # 4. Try UsoClient (Windows 10/Server 2016+)
+    if (-not $result.Success) {
+        try {
+            $result.MethodsAttempted += "UsoClient"
+            $usoClientPath = "$env:SystemRoot\System32\UsoClient.exe"
+            
+            if (Test-Path $usoClientPath) {
+                Write-Host "🔄 Attempting update using UsoClient..." -ForegroundColor Cyan
+                Start-Process -FilePath $usoClientPath -ArgumentList "StartScan" -Wait -NoNewWindow
+                Start-Sleep -Seconds 30
+                Start-Process -FilePath $usoClientPath -ArgumentList "StartDownload" -Wait -NoNewWindow
+                Start-Sleep -Seconds 30
+                Start-Process -FilePath $usoClientPath -ArgumentList "StartInstall" -Wait -NoNewWindow
+                
+                $result.Success = $true
+                $result.Message += "Updates initiated via UsoClient. "
+                # Note: UsoClient doesn't provide direct feedback about updates installed
+            }
+        } catch {
+            $result.Errors += "UsoClient method failed: $($_.Exception.Message)"
+            Write-ErrorLog "Force-WindowsUpdateInstallation: UsoClient failed: $($_.Exception.Message)"
+        }
+    }
+
+    # 5. Final attempt with wuauclt (Legacy systems)
+    if (-not $result.Success) {
+        try {
+            $result.MethodsAttempted += "WUAUCLT"
+            Write-Host "🔄 Attempting update using WUAUCLT..." -ForegroundColor Cyan
+            Start-Process "wuauclt.exe" -ArgumentList "/detectnow /updatenow" -Wait -NoNewWindow
+            Start-Sleep -Seconds 60
+            $result.Message += "Updates initiated via WUAUCLT. "
+            $result.Success = $true
+        } catch {
+            $result.Errors += "WUAUCLT method failed: $($_.Exception.Message)"
+            Write-ErrorLog "Force-WindowsUpdateInstallation: WUAUCLT failed: $($_.Exception.Message)"
+        }
+    }
+
+    # Final status check
+    if (-not $result.Success) {
+        $result.Message = "All update methods failed. "
+        Write-ErrorLog "Force-WindowsUpdateInstallation: All methods failed. Errors: $($result.Errors -join '; ')"
+    }
+
+    # Return detailed results
+    $result | Add-Member -NotePropertyName "TimeStamp" -NotePropertyValue (Get-Date)
+    Write-Host "`n📊 Update Process Summary:" -ForegroundColor Cyan
+    Write-Host "Success: $($result.Success)" -ForegroundColor $(if ($result.Success) { "Green" } else { "Red" })
+    Write-Host "Updates Found: $($result.UpdatesFound)" -ForegroundColor White
+    Write-Host "Updates Installed: $($result.UpdatesInstalled)" -ForegroundColor White
+    Write-Host "Methods Attempted: $($result.MethodsAttempted -join ', ')" -ForegroundColor White
+    Write-Host "Reboot Required: $($result.RebootRequired)" -ForegroundColor $(if ($result.RebootRequired) { "Yellow" } else { "Green" })
+    if ($result.Errors.Count -gt 0) {
+        Write-Host "`nErrors Encountered:" -ForegroundColor Red
+        $result.Errors | ForEach-Object { Write-Host "- $_" -ForegroundColor Red }
+    }
+
     return $result
 }
 
@@ -734,16 +853,11 @@ if (-not $authResult.Success) {
     return
 }
 
-
-
-
-
-
-
     $outputFile = "NON-AD-Prodservers-ForceUpdate.csv"
     $results = @()
     Write-Host "🔍 Retrieving servers from AD..." -ForegroundColor Cyan
    $patterns = @('*TST*', 'ACC*', '*DEV*', '*-TS*', '*ACC*','TST*','ALG*','*CIC*')
+   #$patterns = @('PAR-TST-*')
 # Dynamically construct the filter string
 $filterString = ($patterns | ForEach-Object { "Name -like '$_'" }) -join ' -or '
 
@@ -765,6 +879,18 @@ try {
         $updateResult = "Unknown"
         $rebootScheduled = "No"
         Write-Host "`n🖥️  Processing server: $($serverName) ($ip)" -ForegroundColor White -BackgroundColor DarkBlue
+
+        Write-Host "`n🔍 Running authentication diagnostics..." -ForegroundColor Cyan
+        $authDiagnostics = Test-RemoteAuthentication -Server $serverName -Credential $cred
+        
+        # Log the diagnostic results
+        Write-Host "`n📋 Authentication Diagnostic Results:" -ForegroundColor Yellow
+        foreach ($test in $authDiagnostics.Tests) {
+            $color = if ($test.Result) { "Green" } else { "Red" }
+            Write-Host "  $($test.Name): $(if ($test.Result) { '✅' } else { '❌' }) - $($test.Message)" -ForegroundColor $color
+        }
+
+         
         try {
             if (Test-Connection -ComputerName $serverName -Count 1 -Quiet) {
                 Write-Host "✅ Server $($serverName) is reachable" -ForegroundColor Green
@@ -1337,6 +1463,12 @@ $remoteInfoScript = {
                             if ($policyResult.Success) {
                                 $result.PolicyStatus = "Policy overridden - updates enabled"
                                 $updateResult = Force-WindowsUpdateInstallation
+                                if ($updateResult.Success) {
+                                    Write-Host "Updates completed successfully using $($updateResult.MethodUsed)" -ForegroundColor Green
+                                    } else {
+                                        Write-Host "Update process failed: $($updateResult.Message)" -ForegroundColor Red
+                                        }
+
                                 $result.UpdateResult = $updateResult.Message
                                 $result.UpdateStatus = "Found: $($updateResult.UpdatesFound), Installed: $($updateResult.UpdatesInstalled)"
                                 if ($ScheduleReboot) {
