@@ -856,7 +856,7 @@ if (-not $authResult.Success) {
     $outputFile = "NON-AD-Prodservers-ForceUpdate.csv"
     $results = @()
     Write-Host "🔍 Retrieving servers from AD..." -ForegroundColor Cyan
-   $patterns = @('*TST*', 'ACC*', '*DEV*', '*-TS*', '*ACC*','TST*','ALG*','*CIC*')
+   $patterns = @('*TST*', 'ACC*', '*DEV*', '*-TS*', '*ACC*','TST*','ALG*','*CIC*','VWS*')
    #$patterns = @('PAR-TST-*')
 # Dynamically construct the filter string
 $filterString = ($patterns | ForEach-Object { "Name -like '$_'" }) -join ' -or '
